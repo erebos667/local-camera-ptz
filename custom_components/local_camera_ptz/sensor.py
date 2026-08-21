@@ -62,28 +62,52 @@ def _is_tuya_error(result: dict[str, Any]) -> bool:
     return any(key in result for key in ("Error", "Err", "error", "error_code"))
 
 
-async def _get_tuya_cloud_stream_source(
-    hass: HomeAssistant, device_id: str
-) -> str | None:
-    """Ask the official HA Tuya integration for the same RTSP source it uses."""
+async def _get_tuya_manager(hass: HomeAssistant, device_id: str):
+    """Return the manager from the official Tuya integration for a device."""
     for entry in hass.config_entries.async_entries("tuya"):
         runtime_data = getattr(entry, "runtime_data", None)
         manager = getattr(runtime_data, "manager", None)
         if manager is None:
             continue
-
-        device_map = getattr(manager, "device_map", {})
-        device = device_map.get(device_id)
-        if device is None:
-            continue
-
-        getter = getattr(manager, "get_device_stream_allocate", None)
-        if getter is None:
-            return None
-
-        return await hass.async_add_executor_job(getter, device.id, "rtsp")
-
+        if device_id in getattr(manager, "device_map", {}):
+            return manager
     return None
+
+
+async def _get_tuya_cloud_stream_source(
+    hass: HomeAssistant, device_id: str
+) -> str | None:
+    """Ask the official HA Tuya integration for the same RTSP source it uses."""
+    manager = await _get_tuya_manager(hass, device_id)
+    if manager is None:
+        return None
+
+    getter = getattr(manager, "get_device_stream_allocate", None)
+    if getter is None:
+        return None
+
+    return await hass.async_add_executor_job(getter, device_id, "rtsp")
+
+
+async def _get_tuya_webrtc_config(
+    hass: HomeAssistant, device_id: str
+) -> dict[str, Any] | None:
+    """Query Tuya's WebRTC configuration using HA's authenticated Tuya session."""
+    manager = await _get_tuya_manager(hass, device_id)
+    if manager is None:
+        return None
+
+    customer_api = getattr(manager, "customer_api", None)
+    if customer_api is None:
+        return None
+
+    def _get() -> dict[str, Any] | None:
+        response = customer_api.get(f"/v1.0/devices/{device_id}/webrtc-configs")
+        if not response:
+            return None
+        return response.get("result")
+
+    return await hass.async_add_executor_job(_get)
 
 
 def _sanitize_stream_source(source: str) -> dict[str, Any]:
@@ -104,6 +128,51 @@ def _sanitize_stream_source(source: str) -> dict[str, Any]:
         "has_credentials": parsed.username is not None or parsed.password is not None,
         "has_query": bool(parsed.query),
         "resolution_hints": resolution_hints,
+    }
+
+
+def _parse_webrtc_skill(skill: Any) -> dict[str, Any]:
+    if not isinstance(skill, str):
+        return skill if isinstance(skill, dict) else {}
+    try:
+        parsed = json.loads(skill)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed
+
+
+def _summarize_webrtc_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Keep useful WebRTC capabilities while never exposing auth/ICE secrets."""
+    skill = _parse_webrtc_skill(config.get("skill"))
+    videos = skill.get("videos", []) if isinstance(skill, dict) else []
+    resolutions: list[str] = []
+    video_codecs: list[Any] = []
+    if isinstance(videos, list):
+        for video in videos:
+            if not isinstance(video, dict):
+                continue
+            width = video.get("width")
+            height = video.get("height")
+            if width and height:
+                resolutions.append(f"{width}x{height}")
+            if "codecType" in video:
+                video_codecs.append(video["codecType"])
+
+    p2p = config.get("p2p_config")
+    ice_count = 0
+    if isinstance(p2p, dict) and isinstance(p2p.get("ices"), list):
+        ice_count = len(p2p["ices"])
+
+    return {
+        "supports_webrtc": bool(config.get("supports_webrtc")),
+        "video_clarity": config.get("vedio_clarity", config.get("video_clarity")),
+        "moto_id_present": bool(config.get("moto_id")),
+        "resolutions": resolutions,
+        "video_codec_types": video_codecs,
+        "ice_server_count": ice_count,
+        "skill_version": skill.get("webrtc") if isinstance(skill, dict) else None,
     }
 
 
@@ -313,6 +382,56 @@ class TuyaStreamDiagnosticsSensor(SensorEntity):
             _LOGGER.warning("Tuya stream allocation/probe failed: %s", err)
 
 
+class TuyaWebRTCDiagnosticsSensor(SensorEntity):
+    """Inspect the WebRTC capabilities reported by Tuya for the camera."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_name = "Tuya WebRTC"
+    _attr_icon = "mdi:video-wireless-outline"
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        self.hass = hass
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_tuya_webrtc"
+        self._state = "unknown"
+        self._attrs: dict[str, Any] = {}
+
+    @property
+    def native_value(self) -> str:
+        return self._state
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return self._attrs
+
+    async def async_update(self) -> None:
+        device_id = self._entry.data[CONF_DEVICE_ID]
+        try:
+            config = await _get_tuya_webrtc_config(self.hass, device_id)
+            if not config:
+                self._state = "unavailable"
+                self._attrs = {
+                    "device_id": device_id,
+                    "reason": "Tuya returned no WebRTC configuration",
+                }
+                return
+
+            summary = _summarize_webrtc_config(config)
+            self._state = "supported" if summary["supports_webrtc"] else "unsupported"
+            self._attrs = {
+                "device_id": device_id,
+                **summary,
+            }
+        except Exception as err:  # noqa: BLE001
+            self._state = "error"
+            self._attrs = {
+                "device_id": device_id,
+                "error": str(err),
+                "error_type": type(err).__name__,
+            }
+            _LOGGER.warning("Tuya WebRTC config query failed: %s", err)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -322,4 +441,5 @@ async def async_setup_entry(
         LocalCameraPTZConnectionSensor(entry),
         LocalCameraPTZDpsSensor(entry),
         TuyaStreamDiagnosticsSensor(hass, entry),
+        TuyaWebRTCDiagnosticsSensor(hass, entry),
     ])
