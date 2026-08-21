@@ -1,0 +1,10 @@
+{
+  "domain": "local_camera_ptz",
+  "name": "Local Camera PTZ",
+  "codeowners": ["@erebos667"],
+  "config_flow": true,
+  "documentation": "https://github.com/erebos667/local-camera-ptz",
+  "iot_class": "local_push",
+  "requirements": ["tinytuya==1.16.1"],
+  "version": "0.1.0"
+}
