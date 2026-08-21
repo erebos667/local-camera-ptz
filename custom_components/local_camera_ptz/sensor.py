@@ -12,21 +12,9 @@ from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CONF_DEVICE_ID, CONF_HOST, CONF_LOCAL_KEY, CONF_PROTOCOL, DOMAIN
+from .const import CONF_DEVICE_ID, CONF_HOST, CONF_LOCAL_KEY, CONF_PROTOCOL
 
 _LOGGER = logging.getLogger(__name__)
-
-
-async def _probe(host: str, port: int) -> bool:
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=3
-        )
-        writer.close()
-        await writer.wait_closed()
-        return True
-    except Exception:
-        return False
 
 
 async def _read_tuya_status(entry: ConfigEntry) -> dict[str, Any]:
@@ -41,7 +29,7 @@ async def _read_tuya_status(entry: ConfigEntry) -> dict[str, Any]:
             address=host,
             local_key=local_key,
             version=version,
-            connection_timeout=3,
+            connection_timeout=5,
             connection_retry_limit=1,
             connection_retry_delay=0,
         )
@@ -49,9 +37,27 @@ async def _read_tuya_status(entry: ConfigEntry) -> dict[str, Any]:
         result = device.status()
         if result is None:
             raise RuntimeError("Tuya returned no status")
+        if not isinstance(result, dict):
+            raise RuntimeError(f"Unexpected Tuya response type: {type(result).__name__}")
         return result
 
     return await asyncio.to_thread(_read)
+
+
+def _extract_dps(result: dict[str, Any]) -> dict[str, Any]:
+    dps = result.get("dps")
+    if isinstance(dps, dict):
+        return dps
+    payload = result.get("Payload") or result.get("payload")
+    if isinstance(payload, dict):
+        nested = payload.get("dps")
+        if isinstance(nested, dict):
+            return nested
+    return {}
+
+
+def _is_tuya_error(result: dict[str, Any]) -> bool:
+    return any(key in result for key in ("Error", "Err", "error", "error_code"))
 
 
 class LocalCameraPTZConnectionSensor(SensorEntity):
@@ -75,24 +81,20 @@ class LocalCameraPTZConnectionSensor(SensorEntity):
 
     async def async_update(self) -> None:
         host = self._entry.data[CONF_HOST]
-        if not await _probe(host, 6668):
-            self._state = "unreachable"
-            self._attrs = {"host": host, "port": 6668}
-            return
-
         try:
             result = await _read_tuya_status(self._entry)
-            dps = result.get("dps", {}) if isinstance(result, dict) else {}
-            self._state = "authenticated"
+            dps = _extract_dps(result)
+            raw = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)
+            self._state = "tuya_error" if _is_tuya_error(result) else ("authenticated" if dps else "connected_no_dps")
             self._attrs = {
                 "host": host,
                 "port": 6668,
                 "protocol": self._entry.data.get(CONF_PROTOCOL, 3.3),
                 "dps_count": len(dps),
-                "dps": json.dumps(dps, ensure_ascii=False, sort_keys=True),
+                "raw_response": raw,
             }
         except Exception as err:  # noqa: BLE001
-            self._state = "port_open_key_failed"
+            self._state = "error"
             self._attrs = {
                 "host": host,
                 "port": 6668,
@@ -125,10 +127,12 @@ class LocalCameraPTZDpsSensor(SensorEntity):
     async def async_update(self) -> None:
         try:
             result = await _read_tuya_status(self._entry)
-            dps = result.get("dps", {}) if isinstance(result, dict) else {}
+            dps = _extract_dps(result)
             self._state = len(dps)
             self._attrs = {f"dp_{key}": value for key, value in dps.items()}
-            self._attrs["raw"] = json.dumps(result, ensure_ascii=False, sort_keys=True)
+            self._attrs["raw_response"] = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)
+            if _is_tuya_error(result):
+                self._attrs["tuya_error"] = True
         except Exception as err:  # noqa: BLE001
             self._state = 0
             self._attrs = {"error": str(err), "error_type": type(err).__name__}
@@ -139,9 +143,7 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    async_add_entities(
-        [
-            LocalCameraPTZConnectionSensor(entry),
-            LocalCameraPTZDpsSensor(entry),
-        ]
-    )
+    async_add_entities([
+        LocalCameraPTZConnectionSensor(entry),
+        LocalCameraPTZDpsSensor(entry),
+    ])
