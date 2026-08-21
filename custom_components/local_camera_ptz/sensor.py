@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import logging
 
+import tinytuya
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CONF_DEVICE_ID, CONF_HOST, CONF_LOCAL_KEY, DOMAIN
+from .const import CONF_DEVICE_ID, CONF_HOST, CONF_LOCAL_KEY, CONF_PROTOCOL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,6 +23,13 @@ async def _probe(host: str, port: int) -> bool:
     writer.close()
     await writer.wait_closed()
     return True
+
+
+def _tuya_status(device_id: str, host: str, local_key: str, protocol: float):
+    """Perform a read-only Tuya LAN status request."""
+    device = tinytuya.Device(device_id, host, local_key)
+    device.set_version(protocol)
+    return device.status()
 
 
 class LocalCameraPTZStatusSensor(SensorEntity):
@@ -39,8 +47,24 @@ class LocalCameraPTZStatusSensor(SensorEntity):
         return self._state
 
     async def async_update(self) -> None:
-        host = self._entry.data[CONF_HOST]
-        self._state = "connected" if await _probe(host, 6668) else "unreachable"
+        data = self._entry.data
+        host = data[CONF_HOST]
+        if not await _probe(host, 6668):
+            self._state = "unreachable"
+            return
+
+        try:
+            result = await self.hass.async_add_executor_job(
+                _tuya_status,
+                data[CONF_DEVICE_ID],
+                host,
+                data[CONF_LOCAL_KEY],
+                data[CONF_PROTOCOL],
+            )
+            self._state = "authenticated" if isinstance(result, dict) else "connected"
+        except Exception as err:
+            _LOGGER.debug("Tuya LAN status probe failed: %s", err)
+            self._state = "port_open_key_failed"
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
