@@ -1,0 +1,7 @@
+{
+  "config": {
+    "error": {
+      "local_key_unavailable": "Impossible de récupérer la Local Key depuis l'intégration Tuya de Home Assistant."
+    }
+  }
+}
