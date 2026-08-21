@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -80,9 +81,7 @@ async def _get_tuya_cloud_stream_source(
         if getter is None:
             return None
 
-        return await hass.async_add_executor_job(
-            getter, device.id, "rtsp"
-        )
+        return await hass.async_add_executor_job(getter, device.id, "rtsp")
 
     return None
 
@@ -106,6 +105,78 @@ def _sanitize_stream_source(source: str) -> dict[str, Any]:
         "has_query": bool(parsed.query),
         "resolution_hints": resolution_hints,
     }
+
+
+async def _probe_stream(hass: HomeAssistant, source: str) -> dict[str, Any]:
+    """Probe the allocated stream without exposing its URL in HA state."""
+    ffprobe = shutil.which("ffprobe") or "/usr/bin/ffprobe"
+    command = [
+        ffprobe,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-rtsp_transport",
+        "tcp",
+        "-timeout",
+        "8000000",
+        "-show_entries",
+        "stream=index,codec_type,codec_name,width,height,r_frame_rate,bit_rate",
+        "-of",
+        "json",
+        source,
+    ]
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
+    except asyncio.TimeoutError:
+        try:
+            process.kill()
+        except Exception:  # noqa: BLE001
+            pass
+        return {"probe_status": "timeout"}
+    except Exception as err:  # noqa: BLE001
+        return {"probe_status": "error", "probe_error": str(err)}
+
+    if process.returncode != 0:
+        error = stderr.decode("utf-8", errors="replace").strip()
+        return {
+            "probe_status": "failed",
+            "probe_returncode": process.returncode,
+            "probe_error": error[-500:] if error else "ffprobe failed",
+        }
+
+    try:
+        data = json.loads(stdout.decode("utf-8"))
+    except json.JSONDecodeError as err:
+        return {"probe_status": "invalid_json", "probe_error": str(err)}
+
+    streams = data.get("streams", [])
+    video = [s for s in streams if s.get("codec_type") == "video"]
+    audio = [s for s in streams if s.get("codec_type") == "audio"]
+    result: dict[str, Any] = {
+        "probe_status": "ok",
+        "video_streams": len(video),
+        "audio_streams": len(audio),
+    }
+    if video:
+        first = video[0]
+        result.update(
+            {
+                "video_codec": first.get("codec_name"),
+                "video_width": first.get("width"),
+                "video_height": first.get("height"),
+                "video_fps": first.get("r_frame_rate"),
+                "video_bitrate": first.get("bit_rate"),
+            }
+        )
+    if audio:
+        result["audio_codec"] = audio[0].get("codec_name")
+    return result
 
 
 class LocalCameraPTZConnectionSensor(SensorEntity):
@@ -191,7 +262,7 @@ class LocalCameraPTZDpsSensor(SensorEntity):
 
 
 class TuyaStreamDiagnosticsSensor(SensorEntity):
-    """Inspect the stream source returned by HA's official Tuya integration."""
+    """Inspect and probe the stream source returned by HA's official Tuya integration."""
 
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_name = "Tuya stream"
@@ -226,10 +297,12 @@ class TuyaStreamDiagnosticsSensor(SensorEntity):
                 return
 
             metadata = _sanitize_stream_source(source)
-            self._state = "available"
+            probe = await _probe_stream(self.hass, source)
+            self._state = probe.get("probe_status", "available")
             self._attrs = {
                 "device_id": self._entry.data[CONF_DEVICE_ID],
                 **metadata,
+                **probe,
             }
         except Exception as err:  # noqa: BLE001
             self._state = "error"
@@ -237,7 +310,7 @@ class TuyaStreamDiagnosticsSensor(SensorEntity):
                 "error": str(err),
                 "error_type": type(err).__name__,
             }
-            _LOGGER.warning("Tuya stream allocation failed: %s", err)
+            _LOGGER.warning("Tuya stream allocation/probe failed: %s", err)
 
 
 async def async_setup_entry(
