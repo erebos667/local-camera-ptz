@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shutil
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -12,6 +13,7 @@ from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import CONF_DEVICE_ID, CONF_HOST, CONF_LOCAL_KEY, CONF_PROTOCOL
@@ -99,7 +101,7 @@ def _sanitize_stream_source(source: str) -> dict[str, Any]:
     path = parsed.path or "/"
     lower = source.lower()
     resolution_hints = [
-        token for token in ("1296", "1080", "720", "640", "360") if token in lower
+        token for token in ("2304", "1296", "1080", "720", "640", "360") if token in lower
     ]
     return {
         "scheme": parsed.scheme,
@@ -112,18 +114,50 @@ def _sanitize_stream_source(source: str) -> dict[str, Any]:
     }
 
 
+async def _probe_hls_playlist(hass: HomeAssistant, source: str) -> dict[str, Any]:
+    """Inspect an HLS master/media playlist without exposing its signed URL."""
+    session = async_get_clientsession(hass)
+    try:
+        async with session.get(source, timeout=10) as response:
+            response.raise_for_status()
+            text = await response.text(errors="replace")
+    except Exception as err:  # noqa: BLE001
+        return {"hls_playlist_status": "error", "hls_playlist_error": str(err)}
+
+    variants: list[dict[str, Any]] = []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        if not line.startswith("#EXT-X-STREAM-INF:"):
+            continue
+        attrs = line.split(":", 1)[1]
+        bandwidth_match = re.search(r"(?:^|,)BANDWIDTH=(\d+)", attrs)
+        resolution_match = re.search(r"(?:^|,)RESOLUTION=(\d+x\d+)", attrs)
+        codecs_match = re.search(r"(?:^|,)CODECS=\"([^\"]+)\"", attrs)
+        variants.append(
+            {
+                "bandwidth": int(bandwidth_match.group(1)) if bandwidth_match else None,
+                "resolution": resolution_match.group(1) if resolution_match else None,
+                "codecs": codecs_match.group(1) if codecs_match else None,
+            }
+        )
+        # The following URI is deliberately not exposed.
+        _ = lines[index + 1] if index + 1 < len(lines) else None
+
+    return {
+        "hls_playlist_status": "ok",
+        "hls_playlist_type": "master" if variants else "media",
+        "hls_variant_count": len(variants),
+        "hls_variants": variants,
+    }
+
+
 async def _probe_stream(
     source: str,
     stream_type: str = "rtsp",
 ) -> dict[str, Any]:
     """Probe an allocated Tuya stream without exposing its URL in HA state."""
     ffprobe = shutil.which("ffprobe") or "/usr/bin/ffprobe"
-    command = [
-        ffprobe,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-    ]
+    command = [ffprobe, "-hide_banner", "-loglevel", "error"]
     if stream_type == "rtsp":
         command.extend(["-rtsp_transport", "tcp", "-timeout", "8000000"])
     command.extend([
@@ -214,9 +248,7 @@ class LocalCameraPTZConnectionSensor(SensorEntity):
             result = await _read_tuya_status(self._entry)
             dps = _extract_dps(result)
             raw = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)
-            self._state = "tuya_error" if _is_tuya_error(result) else (
-                "authenticated" if dps else "connected_no_dps"
-            )
+            self._state = "tuya_error" if _is_tuya_error(result) else ("authenticated" if dps else "connected_no_dps")
             self._attrs = {
                 "host": host,
                 "port": 6668,
@@ -261,9 +293,7 @@ class LocalCameraPTZDpsSensor(SensorEntity):
             dps = _extract_dps(result)
             self._state = len(dps)
             self._attrs = {f"dp_{key}": value for key, value in dps.items()}
-            self._attrs["raw_response"] = json.dumps(
-                result, ensure_ascii=False, sort_keys=True, default=str
-            )
+            self._attrs["raw_response"] = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)
             if _is_tuya_error(result):
                 self._attrs["tuya_error"] = True
         except Exception as err:  # noqa: BLE001
@@ -300,9 +330,7 @@ class TuyaStreamDiagnosticsSensor(SensorEntity):
 
         for stream_type in ("rtsp", "hls", "flv"):
             try:
-                source = await _get_tuya_cloud_stream_source(
-                    self.hass, device_id, stream_type
-                )
+                source = await _get_tuya_cloud_stream_source(self.hass, device_id, stream_type)
                 if not source:
                     results[f"{stream_type}_status"] = "no_url"
                     continue
@@ -313,14 +341,14 @@ class TuyaStreamDiagnosticsSensor(SensorEntity):
                 results[f"{stream_type}_scheme"] = metadata.get("scheme")
                 results[f"{stream_type}_host"] = metadata.get("host")
                 results[f"{stream_type}_port"] = metadata.get("port")
-                results[f"{stream_type}_resolution_hints"] = metadata.get(
-                    "resolution_hints", []
-                )
+                results[f"{stream_type}_resolution_hints"] = metadata.get("resolution_hints", [])
                 results[f"{stream_type}_width"] = probe.get("video_width")
                 results[f"{stream_type}_height"] = probe.get("video_height")
                 results[f"{stream_type}_codec"] = probe.get("video_codec")
                 results[f"{stream_type}_fps"] = probe.get("video_fps")
                 results[f"{stream_type}_bitrate"] = probe.get("video_bitrate")
+                if stream_type == "hls":
+                    results.update(await _probe_hls_playlist(self.hass, source))
                 if probe.get("probe_status") == "ok":
                     successful += 1
             except Exception as err:  # noqa: BLE001
