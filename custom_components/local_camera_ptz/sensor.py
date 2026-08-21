@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import shutil
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import tinytuya
@@ -75,9 +75,11 @@ async def _get_tuya_manager(hass: HomeAssistant, device_id: str):
 
 
 async def _get_tuya_cloud_stream_source(
-    hass: HomeAssistant, device_id: str
+    hass: HomeAssistant,
+    device_id: str,
+    stream_type: Literal["flv", "hls", "rtmp", "rtsp"] = "rtsp",
 ) -> str | None:
-    """Ask the official HA Tuya integration for the same RTSP source it uses."""
+    """Ask the official HA Tuya integration for an allocated stream."""
     manager = await _get_tuya_manager(hass, device_id)
     if manager is None:
         return None
@@ -86,28 +88,7 @@ async def _get_tuya_cloud_stream_source(
     if getter is None:
         return None
 
-    return await hass.async_add_executor_job(getter, device_id, "rtsp")
-
-
-async def _get_tuya_webrtc_config(
-    hass: HomeAssistant, device_id: str
-) -> dict[str, Any] | None:
-    """Query Tuya's WebRTC configuration using HA's authenticated Tuya session."""
-    manager = await _get_tuya_manager(hass, device_id)
-    if manager is None:
-        return None
-
-    customer_api = getattr(manager, "customer_api", None)
-    if customer_api is None:
-        return None
-
-    def _get() -> dict[str, Any] | None:
-        response = customer_api.get(f"/v1.0/devices/{device_id}/webrtc-configs")
-        if not response:
-            return None
-        return response.get("result")
-
-    return await hass.async_add_executor_job(_get)
+    return await hass.async_add_executor_job(getter, device_id, stream_type)
 
 
 def _sanitize_stream_source(source: str) -> dict[str, Any]:
@@ -131,70 +112,29 @@ def _sanitize_stream_source(source: str) -> dict[str, Any]:
     }
 
 
-def _parse_webrtc_skill(skill: Any) -> dict[str, Any]:
-    if not isinstance(skill, str):
-        return skill if isinstance(skill, dict) else {}
-    try:
-        parsed = json.loads(skill)
-    except (TypeError, json.JSONDecodeError):
-        return {}
-    if not isinstance(parsed, dict):
-        return {}
-    return parsed
-
-
-def _summarize_webrtc_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Keep useful WebRTC capabilities while never exposing auth/ICE secrets."""
-    skill = _parse_webrtc_skill(config.get("skill"))
-    videos = skill.get("videos", []) if isinstance(skill, dict) else []
-    resolutions: list[str] = []
-    video_codecs: list[Any] = []
-    if isinstance(videos, list):
-        for video in videos:
-            if not isinstance(video, dict):
-                continue
-            width = video.get("width")
-            height = video.get("height")
-            if width and height:
-                resolutions.append(f"{width}x{height}")
-            if "codecType" in video:
-                video_codecs.append(video["codecType"])
-
-    p2p = config.get("p2p_config")
-    ice_count = 0
-    if isinstance(p2p, dict) and isinstance(p2p.get("ices"), list):
-        ice_count = len(p2p["ices"])
-
-    return {
-        "supports_webrtc": bool(config.get("supports_webrtc")),
-        "video_clarity": config.get("vedio_clarity", config.get("video_clarity")),
-        "moto_id_present": bool(config.get("moto_id")),
-        "resolutions": resolutions,
-        "video_codec_types": video_codecs,
-        "ice_server_count": ice_count,
-        "skill_version": skill.get("webrtc") if isinstance(skill, dict) else None,
-    }
-
-
-async def _probe_stream(hass: HomeAssistant, source: str) -> dict[str, Any]:
-    """Probe the allocated stream without exposing its URL in HA state."""
+async def _probe_stream(
+    source: str,
+    stream_type: str = "rtsp",
+) -> dict[str, Any]:
+    """Probe an allocated Tuya stream without exposing its URL in HA state."""
     ffprobe = shutil.which("ffprobe") or "/usr/bin/ffprobe"
     command = [
         ffprobe,
         "-hide_banner",
         "-loglevel",
         "error",
-        "-rtsp_transport",
-        "tcp",
-        "-timeout",
-        "8000000",
+    ]
+    if stream_type == "rtsp":
+        command.extend(["-rtsp_transport", "tcp", "-timeout", "8000000"])
+    command.extend([
         "-show_entries",
         "stream=index,codec_type,codec_name,width,height,r_frame_rate,bit_rate",
         "-of",
         "json",
         source,
-    ]
+    ])
 
+    process = None
     try:
         process = await asyncio.create_subprocess_exec(
             *command,
@@ -203,10 +143,11 @@ async def _probe_stream(hass: HomeAssistant, source: str) -> dict[str, Any]:
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
     except asyncio.TimeoutError:
-        try:
-            process.kill()
-        except Exception:  # noqa: BLE001
-            pass
+        if process is not None:
+            try:
+                process.kill()
+            except Exception:  # noqa: BLE001
+                pass
         return {"probe_status": "timeout"}
     except Exception as err:  # noqa: BLE001
         return {"probe_status": "error", "probe_error": str(err)}
@@ -331,7 +272,7 @@ class LocalCameraPTZDpsSensor(SensorEntity):
 
 
 class TuyaStreamDiagnosticsSensor(SensorEntity):
-    """Inspect and probe the stream source returned by HA's official Tuya integration."""
+    """Probe every stream protocol offered by Tuya's HA integration."""
 
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_name = "Tuya stream"
@@ -353,83 +294,41 @@ class TuyaStreamDiagnosticsSensor(SensorEntity):
         return self._attrs
 
     async def async_update(self) -> None:
-        try:
-            source = await _get_tuya_cloud_stream_source(
-                self.hass, self._entry.data[CONF_DEVICE_ID]
-            )
-            if not source:
-                self._state = "unavailable"
-                self._attrs = {
-                    "device_id": self._entry.data[CONF_DEVICE_ID],
-                    "reason": "Tuya did not return an RTSP stream source",
-                }
-                return
-
-            metadata = _sanitize_stream_source(source)
-            probe = await _probe_stream(self.hass, source)
-            self._state = probe.get("probe_status", "available")
-            self._attrs = {
-                "device_id": self._entry.data[CONF_DEVICE_ID],
-                **metadata,
-                **probe,
-            }
-        except Exception as err:  # noqa: BLE001
-            self._state = "error"
-            self._attrs = {
-                "error": str(err),
-                "error_type": type(err).__name__,
-            }
-            _LOGGER.warning("Tuya stream allocation/probe failed: %s", err)
-
-
-class TuyaWebRTCDiagnosticsSensor(SensorEntity):
-    """Inspect the WebRTC capabilities reported by Tuya for the camera."""
-
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_name = "Tuya WebRTC"
-    _attr_icon = "mdi:video-wireless-outline"
-
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
-        self.hass = hass
-        self._entry = entry
-        self._attr_unique_id = f"{entry.entry_id}_tuya_webrtc"
-        self._state = "unknown"
-        self._attrs: dict[str, Any] = {}
-
-    @property
-    def native_value(self) -> str:
-        return self._state
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        return self._attrs
-
-    async def async_update(self) -> None:
         device_id = self._entry.data[CONF_DEVICE_ID]
-        try:
-            config = await _get_tuya_webrtc_config(self.hass, device_id)
-            if not config:
-                self._state = "unavailable"
-                self._attrs = {
-                    "device_id": device_id,
-                    "reason": "Tuya returned no WebRTC configuration",
-                }
-                return
+        results: dict[str, Any] = {}
+        successful = 0
 
-            summary = _summarize_webrtc_config(config)
-            self._state = "supported" if summary["supports_webrtc"] else "unsupported"
-            self._attrs = {
-                "device_id": device_id,
-                **summary,
-            }
-        except Exception as err:  # noqa: BLE001
-            self._state = "error"
-            self._attrs = {
-                "device_id": device_id,
-                "error": str(err),
-                "error_type": type(err).__name__,
-            }
-            _LOGGER.warning("Tuya WebRTC config query failed: %s", err)
+        for stream_type in ("rtsp", "hls", "flv"):
+            try:
+                source = await _get_tuya_cloud_stream_source(
+                    self.hass, device_id, stream_type
+                )
+                if not source:
+                    results[f"{stream_type}_status"] = "no_url"
+                    continue
+
+                metadata = _sanitize_stream_source(source)
+                probe = await _probe_stream(source, stream_type)
+                results[f"{stream_type}_status"] = probe.get("probe_status")
+                results[f"{stream_type}_scheme"] = metadata.get("scheme")
+                results[f"{stream_type}_host"] = metadata.get("host")
+                results[f"{stream_type}_port"] = metadata.get("port")
+                results[f"{stream_type}_resolution_hints"] = metadata.get(
+                    "resolution_hints", []
+                )
+                results[f"{stream_type}_width"] = probe.get("video_width")
+                results[f"{stream_type}_height"] = probe.get("video_height")
+                results[f"{stream_type}_codec"] = probe.get("video_codec")
+                results[f"{stream_type}_fps"] = probe.get("video_fps")
+                results[f"{stream_type}_bitrate"] = probe.get("video_bitrate")
+                if probe.get("probe_status") == "ok":
+                    successful += 1
+            except Exception as err:  # noqa: BLE001
+                results[f"{stream_type}_status"] = "error"
+                results[f"{stream_type}_error"] = str(err)
+
+        self._state = "ok" if successful else "failed"
+        self._attrs = {"device_id": device_id, **results}
 
 
 async def async_setup_entry(
@@ -441,5 +340,4 @@ async def async_setup_entry(
         LocalCameraPTZConnectionSensor(entry),
         LocalCameraPTZDpsSensor(entry),
         TuyaStreamDiagnosticsSensor(hass, entry),
-        TuyaWebRTCDiagnosticsSensor(hass, entry),
     ])
