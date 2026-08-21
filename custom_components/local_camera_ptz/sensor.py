@@ -6,7 +6,7 @@ import logging
 import re
 import shutil
 from typing import Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import tinytuya
 from homeassistant.components.sensor import SensorEntity
@@ -114,8 +114,26 @@ def _sanitize_stream_source(source: str) -> dict[str, Any]:
     }
 
 
+def _authorized_segment_url(source: str, segment_uri: str) -> str:
+    """Resolve a media segment while retaining Tuya's signed query when needed."""
+    segment_url = urljoin(source, segment_uri)
+    source_parts = urlsplit(source)
+    segment_parts = urlsplit(segment_url)
+    if not segment_parts.query and source_parts.query:
+        segment_url = urlunsplit(
+            (
+                segment_parts.scheme,
+                segment_parts.netloc,
+                segment_parts.path,
+                source_parts.query,
+                segment_parts.fragment,
+            )
+        )
+    return segment_url
+
+
 async def _probe_hls_playlist(hass: HomeAssistant, source: str) -> dict[str, Any]:
-    """Inspect an HLS master/media playlist without exposing its signed URL."""
+    """Inspect an HLS playlist and estimate bitrate from one media segment."""
     session = async_get_clientsession(hass)
     try:
         async with session.get(source, timeout=10) as response:
@@ -140,21 +158,51 @@ async def _probe_hls_playlist(hass: HomeAssistant, source: str) -> dict[str, Any
                 "codecs": codecs_match.group(1) if codecs_match else None,
             }
         )
-        # The following URI is deliberately not exposed.
         _ = lines[index + 1] if index + 1 < len(lines) else None
 
-    return {
+    segment_uri: str | None = None
+    segment_duration: float | None = None
+    for index, line in enumerate(lines):
+        if not line.startswith("#EXTINF:"):
+            continue
+        duration_text = line.split(":", 1)[1].split(",", 1)[0]
+        try:
+            segment_duration = float(duration_text)
+        except ValueError:
+            segment_duration = None
+        if index + 1 < len(lines) and not lines[index + 1].startswith("#"):
+            segment_uri = lines[index + 1]
+            break
+
+    result: dict[str, Any] = {
         "hls_playlist_status": "ok",
         "hls_playlist_type": "master" if variants else "media",
         "hls_variant_count": len(variants),
         "hls_variants": variants,
     }
 
+    if segment_uri and segment_duration and segment_duration > 0:
+        try:
+            segment_url = _authorized_segment_url(source, segment_uri)
+            async with session.get(segment_url, timeout=10) as response:
+                response.raise_for_status()
+                segment = await response.read()
+            result["hls_segment_bytes"] = len(segment)
+            result["hls_segment_duration"] = segment_duration
+            result["hls_estimated_bitrate"] = round((len(segment) * 8) / segment_duration)
+            result["hls_estimated_bitrate_kbps"] = round(
+                (len(segment) * 8) / segment_duration / 1000, 1
+            )
+        except Exception as err:  # noqa: BLE001
+            result["hls_segment_status"] = "error"
+            result["hls_segment_error"] = str(err)
+    else:
+        result["hls_segment_status"] = "not_found"
 
-async def _probe_stream(
-    source: str,
-    stream_type: str = "rtsp",
-) -> dict[str, Any]:
+    return result
+
+
+async def _probe_stream(source: str, stream_type: str = "rtsp") -> dict[str, Any]:
     """Probe an allocated Tuya stream without exposing its URL in HA state."""
     ffprobe = shutil.which("ffprobe") or "/usr/bin/ffprobe"
     command = [ffprobe, "-hide_banner", "-loglevel", "error"]
@@ -249,22 +297,10 @@ class LocalCameraPTZConnectionSensor(SensorEntity):
             dps = _extract_dps(result)
             raw = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)
             self._state = "tuya_error" if _is_tuya_error(result) else ("authenticated" if dps else "connected_no_dps")
-            self._attrs = {
-                "host": host,
-                "port": 6668,
-                "protocol": self._entry.data.get(CONF_PROTOCOL, 3.3),
-                "dps_count": len(dps),
-                "raw_response": raw,
-            }
+            self._attrs = {"host": host, "port": 6668, "protocol": self._entry.data.get(CONF_PROTOCOL, 3.3), "dps_count": len(dps), "raw_response": raw}
         except Exception as err:  # noqa: BLE001
             self._state = "error"
-            self._attrs = {
-                "host": host,
-                "port": 6668,
-                "protocol": self._entry.data.get(CONF_PROTOCOL, 3.3),
-                "error": str(err),
-                "error_type": type(err).__name__,
-            }
+            self._attrs = {"host": host, "port": 6668, "protocol": self._entry.data.get(CONF_PROTOCOL, 3.3), "error": str(err), "error_type": type(err).__name__}
             _LOGGER.warning("Local Tuya status failed for %s: %s", host, err)
 
 
