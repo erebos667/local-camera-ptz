@@ -13,16 +13,15 @@ from .const import CONF_DEVICE_ID
 
 
 class TuyaAllocatedStreamCamera(CameraEntity):
-    """Expose the stream allocated by the official Tuya integration."""
+    """Expose the high-resolution HLS stream allocated by the official Tuya integration."""
 
     _attr_supported_features = CameraEntityFeature.STREAM
     _attr_name = "Tuya allocated stream"
     _attr_icon = "mdi:video-wireless"
     _attr_brand = "Tuya"
-    _attr_model = "Allocated RTSP stream"
+    _attr_model = "Allocated HLS stream"
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
-        """Initialize the allocated stream camera."""
         super().__init__()
         self.hass = hass
         self._entry = entry
@@ -39,7 +38,12 @@ class TuyaAllocatedStreamCamera(CameraEntity):
 
     @override
     async def stream_source(self) -> str | None:
-        """Return the RTSP source allocated by Tuya."""
+        """Return the HLS source allocated by Tuya.
+
+        The RTSP allocation exposed by this camera is only 640x360 on the
+        user's LSC camera, while Tuya's HLS allocation is 1920x1080. Use HLS
+        here so Advanced Camera Card receives the higher-resolution stream.
+        """
         manager = self._get_manager()
         if manager is None:
             return None
@@ -47,14 +51,14 @@ class TuyaAllocatedStreamCamera(CameraEntity):
         return await self.hass.async_add_executor_job(
             manager.get_device_stream_allocate,
             self._entry.data[CONF_DEVICE_ID],
-            "rtsp",
+            "hls",
         )
 
     @override
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        """Return a still image from the allocated stream."""
+        """Return a still image from the allocated HLS stream."""
         stream_source = await self.stream_source()
         if not stream_source:
             return None
